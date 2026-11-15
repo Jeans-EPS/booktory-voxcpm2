@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: read # download artifacts of an earlier run (reuse_run)
 
 concurrency:
   group: booktory-release-${{ github.ref }}
