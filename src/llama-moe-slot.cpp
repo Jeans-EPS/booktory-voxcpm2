@@ -28,6 +28,16 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+// Windows has no <sys/uio.h> and MSVC has no ssize_t; the Windows path below
+// reads one iovec at a time with _read, so a plain struct is enough.
+#ifdef _MSC_VER
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
+struct iovec {
+    void * iov_base;
+    size_t iov_len;
+};
 #else
 #include <fcntl.h>
 #include <sys/uio.h>
