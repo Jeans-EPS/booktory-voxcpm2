@@ -194,6 +194,13 @@ set_target_properties  (${TARGET_VOXCPM2_CLI} PROPERTIES OUTPUT_NAME voxcpm2-cli
 target_link_libraries  (${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2_runtime llama-common ggml Threads::Threads)
 target_include_directories(${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2)
 target_compile_features(${TARGET_VOXCPM2_CLI} PRIVATE cxx_std_17)
+if (GGML_CUDA)
+    # --version exits 3 when the GPU build finds no usable GPU
+    target_compile_definitions(${TARGET_VOXCPM2_CLI} PRIVATE VOXCPM2_EXPECT_GPU)
+endif()
+if (DEFINED VOXCPM2_CLI_VERSION)
+    target_compile_definitions(${TARGET_VOXCPM2_CLI} PRIVATE VOXCPM2_CLI_VERSION="${VOXCPM2_CLI_VERSION}")
+endif()
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET_VOXCPM2_CLI} RUNTIME)
 endif()
