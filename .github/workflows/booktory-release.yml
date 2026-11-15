@@ -10,6 +10,10 @@ on:
       tag:
         description: "Release tag to (re)publish, e.g. voxcpm2-v1"
         required: true
+      reuse_run:
+        description: "Run id whose linux-cpu, linux-cuda and windows-cpu artifacts are reused (only windows-cuda is rebuilt); empty = build all"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,6 +36,7 @@ env:
 
 jobs:
   linux-cpu:
+    if: ${{ !github.event.inputs.reuse_run }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -59,6 +64,7 @@ jobs:
           path: dist/*
 
   linux-cuda:
+    if: ${{ !github.event.inputs.reuse_run }}
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     container: nvidia/cuda:12.4.1-devel-ubuntu22.04
@@ -107,6 +113,7 @@ jobs:
           path: dist/*
 
   windows-cpu:
+    if: ${{ !github.event.inputs.reuse_run }}
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -152,7 +159,8 @@ jobs:
           New-Item -ItemType Directory -Force dist, cudart | Out-Null
           7z a dist\voxcpm2-cli-win-x64-cuda12.zip .\build\bin\voxcpm2-cli.exe
           foreach ($d in "bin", "bin\x64") {
-            Get-ChildItem "$env:CUDA_PATH\$d" -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination cudart
+            # -Include only filters when the path has a wildcard
+            Get-ChildItem "$env:CUDA_PATH\$d\*" -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination cudart
           }
           if (-not (Get-ChildItem cudart)) { throw "no CUDA runtime DLLs found under $env:CUDA_PATH" }
           Get-ChildItem cudart
@@ -164,6 +172,7 @@ jobs:
 
   release:
     needs: [linux-cpu, linux-cuda, windows-cpu, windows-cuda]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -171,6 +180,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Reuse artifacts of an earlier run
+        if: ${{ github.event.inputs.reuse_run }}
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          run-id: ${{ github.event.inputs.reuse_run }}
+          github-token: ${{ github.token }}
+          pattern: "{linux-cpu,linux-cuda,windows-cpu}"
       - name: Checksums
         working-directory: dist
         run: |
