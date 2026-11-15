@@ -41,8 +41,15 @@ struct MiniCPMLM {
      * Initialize from GGUF file.
      * @param path       GGUF file path (LLM_ARCH_MINICPM format)
      * @param n_gpu_layers  GPU offload layers (-1 = all)
+     * @param n_ctx      KV cache length in positions (booktory: was fixed at 32768)
      */
-    bool init(const std::string & path, int n_gpu_layers = -1);
+    bool init(const std::string & path, int n_gpu_layers = -1, int n_ctx = 4096);
+
+    /**
+     * booktory: drop every KV cache position >= n_keep, so a prefill can
+     * continue after a reused prefix.
+     */
+    void truncate_kv_cache(int n_keep);
 
     /**
      * Prefill: feed a batch of embedding tokens into the model.

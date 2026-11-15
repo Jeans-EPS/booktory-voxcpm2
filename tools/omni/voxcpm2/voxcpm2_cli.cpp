@@ -92,6 +92,9 @@ struct CliConfig {
     float  temperature   = 1.0f;
     int    n_gpu_layers  = -1;
     int    seed          = 42;
+    int    lm_ctx        = 4096;  // booktory: BaseLM n_ctx (upstream 32768)
+    int    residual_ctx  = 4096;  // booktory: ResidualLM KV length (upstream 32768)
+    bool   prefix_cache  = true;  // booktory: reuse reference/prefix work across clips
 };
 
 static void print_usage(const char * prog) {
@@ -108,9 +111,15 @@ static void print_usage(const char * prog) {
         "  -t, --text TEXT      Input text to synthesize\n"
         "  --text-file PATH     Read the input text from a UTF-8 file\n"
         "  --batch PATH         Synthesize many clips with one model load. Each line of\n"
-        "                       the UTF-8 file is <output.wav> TAB <cfg> TAB <text>;\n"
-        "                       an empty cfg uses --cfg. One JSON result line per clip\n"
-        "                       is printed to stdout. Exit 2 if any clip failed.\n"
+        "                       the UTF-8 file is <output.wav> TAB <cfg> TAB <text> or\n"
+        "                       <output.wav> TAB <cfg> TAB <steps> TAB <text>; an empty\n"
+        "                       cfg uses --cfg, an empty steps uses --steps. One JSON\n"
+        "                       result line per clip is printed to stdout (with stage\n"
+        "                       timings). Exit 2 if any clip failed.\n"
+        "  --lm-ctx N           BaseLM context length (default: 4096)\n"
+        "  --residual-ctx N     ResidualLM KV cache length (default: 4096)\n"
+        "  --no-prefix-cache    Recompute the reference and the shared prompt prefix\n"
+        "                       for every clip\n"
         "  --threads N          CPU threads (default: physical cores)\n"
         "  --version            Print the version and compute devices, then exit\n"
         "  -o, --output PATH    Output WAV file path (default: output.wav)\n"
@@ -201,6 +210,12 @@ static bool parse_args(int argc, char ** argv, CliConfig & cfg) {
             if (++i < argc) cfg.temperature = static_cast<float>(std::atof(argv[i]));
         } else if (arg == "--seed") {
             if (++i < argc) cfg.seed = std::atoi(argv[i]);
+        } else if (arg == "--lm-ctx") {
+            if (++i < argc) cfg.lm_ctx = std::atoi(argv[i]);
+        } else if (arg == "--residual-ctx") {
+            if (++i < argc) cfg.residual_ctx = std::atoi(argv[i]);
+        } else if (arg == "--no-prefix-cache") {
+            cfg.prefix_cache = false;
         } else if (arg == "--n-gpu-layers") {
             if (++i < argc) cfg.n_gpu_layers = std::atoi(argv[i]);
         } else if (cfg.base_lm_path.empty()) {
@@ -322,9 +337,11 @@ struct Clip {
     std::string output_path;
     std::string text;
     float       cfg_value;
+    int         max_steps;
 };
 
-// Parse a batch file: one clip per line, <output.wav> TAB <cfg> TAB <text>.
+// Parse a batch file: one clip per line, <output.wav> TAB <cfg> TAB <text>, or with a
+// per-clip decode cap <output.wav> TAB <cfg> TAB <steps> TAB <text> (texts hold no TAB).
 // Blank lines and lines starting with '#' are skipped.
 static bool read_batch(const CliConfig & cfg, std::vector<Clip> & clips) {
     std::string body;
@@ -346,7 +363,19 @@ static bool read_batch(const CliConfig & cfg, std::vector<Clip> & clips) {
         c.output_path = line.substr(0, t1);
         const std::string cfg_col = line.substr(t1 + 1, t2 - t1 - 1);
         c.cfg_value = cfg_col.empty() ? cfg.cfg_value : static_cast<float>(std::atof(cfg_col.c_str()));
-        c.text = line.substr(t2 + 1);
+        const size_t t3 = line.find('\t', t2 + 1);
+        if (t3 == std::string::npos) {
+            c.max_steps = cfg.max_steps;
+            c.text      = line.substr(t2 + 1);
+        } else {
+            const std::string steps_col = line.substr(t2 + 1, t3 - t2 - 1);
+            c.max_steps = steps_col.empty() ? cfg.max_steps : std::atoi(steps_col.c_str());
+            c.text      = line.substr(t3 + 1);
+            if (c.max_steps <= 0) {
+                LOG_ERR("%s:%d: steps must be a positive integer\n", cfg.batch_file.c_str(), lineno);
+                return false;
+            }
+        }
         if (c.output_path.empty() || c.text.empty()) {
             LOG_ERR("%s:%d: empty output path or text\n", cfg.batch_file.c_str(), lineno);
             return false;
@@ -449,7 +478,7 @@ static int run_synthesis(const CliConfig & cfg) {
     if (!cfg.batch_file.empty()) {
         if (!read_batch(cfg, clips)) return 1;
     } else {
-        clips.push_back({ cfg.output_path, cfg.text, cfg.cfg_value });
+        clips.push_back({ cfg.output_path, cfg.text, cfg.cfg_value, cfg.max_steps });
     }
 
     LOG_INF("VoxCPM2 CLI — Text-to-Speech Synthesis\n");
@@ -458,6 +487,7 @@ static int run_synthesis(const CliConfig & cfg) {
     LOG_INF("  Clips:    %zu\n", clips.size());
     LOG_INF("  Backend:  %s\n", cfg.use_gpu ? "GPU" : "CPU");
     LOG_INF("  Threads:  %d\n", cfg.n_threads);
+    LOG_INF("  Context:  lm=%d residual=%d prefix_cache=%s\n", cfg.lm_ctx, cfg.residual_ctx, cfg.prefix_cache ? "on" : "off");
     LOG_INF("  Config:   steps=%d timesteps=%d cfg=%.1f temp=%.1f seed=%d\n",
             cfg.max_steps, cfg.timesteps, cfg.cfg_value, cfg.temperature, cfg.seed);
 
@@ -466,7 +496,11 @@ static int run_synthesis(const CliConfig & cfg) {
 
     auto t_load = std::chrono::steady_clock::now();
     VoxCPM2Runtime runtime;
-    if (!runtime.init(cfg.base_lm_path, cfg.acoustic_path, cfg.n_gpu_layers, cfg.use_gpu)) {
+    VoxCPM2RuntimeOptions options;
+    options.lm_ctx       = cfg.lm_ctx;
+    options.residual_ctx = cfg.residual_ctx;
+    options.prefix_cache = cfg.prefix_cache;
+    if (!runtime.init(cfg.base_lm_path, cfg.acoustic_path, cfg.n_gpu_layers, cfg.use_gpu, options)) {
         LOG_ERR("Failed to initialize VoxCPM2 runtime: %s\n", runtime.last_error().c_str());
         return 1;
     }
@@ -480,17 +514,25 @@ static int run_synthesis(const CliConfig & cfg) {
         LOG_INF("[%zu/%zu] Text: \"%s\"\n", i + 1, clips.size(), clip.text.c_str());
 
         VoxCPM2GenerateParams params;
-        params.max_steps           = cfg.max_steps;
+        params.max_steps           = clip.max_steps;
         params.inference_timesteps = cfg.timesteps;
         params.cfg_value           = clip.cfg_value;
         params.temperature         = cfg.temperature;
         params.seed                = static_cast<uint32_t>(cfg.seed);
 
         std::vector<float> wav;
+        runtime.stats = {};
         auto t_start = std::chrono::steady_clock::now();
         const bool ok = synthesize(runtime, cfg, vp, clip.text, params, wav);
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
         double seconds = 0.0;
+        {
+            const VoxCPM2ClipStats & st = runtime.stats;
+            LOG_INF("Stages: ref_encode=%.2fs%s locenc=%.2fs lm_prefill=%.2fs res_prefill=%.2fs cfm=%.2fs lm_step=%.2fs res_step=%.2fs vae_decode=%.2fs (prompt %d, reused %d, steps %d/%d%s)\n",
+                    st.ref_encode, st.ref_cached ? " (cached)" : "", st.locenc, st.lm_prefill, st.res_prefill, st.cfm, st.lm_step,
+                    st.res_step, st.vae_decode, st.prompt_positions, st.reused_positions, st.steps, clip.max_steps,
+                    st.capped ? ", capped" : "");
+        }
         if (ok) {
             report_stats(wav, sample_rate, elapsed);
             write_wav(clip.output_path, wav, sample_rate);
@@ -500,8 +542,15 @@ static int run_synthesis(const CliConfig & cfg) {
             ++failed;
         }
         if (!cfg.batch_file.empty()) {
-            std::fprintf(stdout, "{\"index\":%zu,\"output\":\"%s\",\"ok\":%s,\"seconds\":%.3f,\"elapsed\":%.3f,\"sampleRate\":%d}\n",
-                         i + 1, json_escape(clip.output_path).c_str(), ok ? "true" : "false", seconds, elapsed, sample_rate);
+            const VoxCPM2ClipStats & st = runtime.stats;
+            std::fprintf(stdout,
+                         "{\"index\":%zu,\"output\":\"%s\",\"ok\":%s,\"seconds\":%.3f,\"elapsed\":%.3f,\"sampleRate\":%d,"
+                         "\"steps\":%d,\"maxSteps\":%d,\"capped\":%s,\"promptPositions\":%d,\"reusedPositions\":%d,"
+                         "\"stages\":{\"refEncode\":%.3f,\"locEnc\":%.3f,\"lmPrefill\":%.3f,\"resPrefill\":%.3f,"
+                         "\"cfm\":%.3f,\"lmStep\":%.3f,\"resStep\":%.3f,\"vaeDecode\":%.3f}}\n",
+                         i + 1, json_escape(clip.output_path).c_str(), ok ? "true" : "false", seconds, elapsed, sample_rate,
+                         st.steps, clip.max_steps, st.capped ? "true" : "false", st.prompt_positions, st.reused_positions,
+                         st.ref_encode, st.locenc, st.lm_prefill, st.res_prefill, st.cfm, st.lm_step, st.res_step, st.vae_decode);
             std::fflush(stdout);
         }
     }

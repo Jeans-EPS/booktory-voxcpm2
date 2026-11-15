@@ -8,6 +8,7 @@
 #define GGML_KQ_MASK_PAD 256
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -72,6 +73,33 @@ static std::vector<float> tensor_to_vector(ggml_tensor * tensor) {
     std::vector<float> out(static_cast<size_t>(ggml_nelements(tensor)));
     ggml_backend_tensor_get(tensor, out.data(), 0, out.size() * sizeof(float));
     return out;
+}
+
+// booktory: stage timers.
+using StageClock = std::chrono::steady_clock;
+
+static double seconds_since(StageClock::time_point t) {
+    return std::chrono::duration<double>(StageClock::now() - t).count();
+}
+
+// booktory: LocEnc patches per graph. forward_sequence unrolls one transformer
+// per patch, so one graph over a long prefill overflowed the graph's node limit
+// (GGML_ASSERT n_nodes < size) once a prompt transcript was added.
+constexpr int kLocEncPatchesPerGraph = 32;
+
+// booktory: causal mask for n_tokens queries that follow n_past cached keys.
+static std::vector<float> make_causal_mask_offset(int n_tokens, int n_past) {
+    const int   n_kv    = n_past + n_tokens;
+    const int   padded  = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    std::vector<float> mask(static_cast<size_t>(n_kv) * static_cast<size_t>(padded), neg_inf);
+    for (int q = 0; q < n_tokens; ++q) {
+        for (int k = 0; k <= n_past + q; ++k) {
+            mask[static_cast<size_t>(k) + static_cast<size_t>(q) * static_cast<size_t>(n_kv)] = 0.0f;
+        }
+    }
+    return mask;
 }
 
 static std::vector<float> make_causal_mask(int n_tokens) {
@@ -368,7 +396,7 @@ VoxCPM2ResidualLM::~VoxCPM2ResidualLM() {
     free();
 }
 
-bool VoxCPM2ResidualLM::init_from_gguf(const std::string & path, ggml_backend_t backend_in) {
+bool VoxCPM2ResidualLM::init_from_gguf(const std::string & path, ggml_backend_t backend_in, int max_length) {
     free();
     if (!backend_in) {
         LOG_ERR("VoxCPM2ResidualLM: backend is null\n");
@@ -387,7 +415,8 @@ bool VoxCPM2ResidualLM::init_from_gguf(const std::string & path, ggml_backend_t 
     config.n_heads        = 16;
     config.n_kv_heads     = 2;
     config.head_dim       = config.hidden_size / config.n_heads;
-    config.max_length     = 32768;
+    // booktory: upstream fixed 32768 (about 0.54 GB of F32 KV); a beat needs about 1,000.
+    config.max_length     = max_length > 0 ? max_length : 4096;
     config.use_flash_attn = false;
 
     // Read no_rope from GGUF metadata; default to false for v0.5/v1.5 models
@@ -465,14 +494,21 @@ std::vector<float> VoxCPM2ResidualLM::forward_last(const std::vector<float> & in
     return last;
 }
 
-std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & input, int seq_len) {
-    if (!backend || seq_len <= 0 || config.hidden_size <= 0 ||
+std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & input, int seq_len, int n_past) {
+    if (!backend || seq_len <= 0 || n_past < 0 || config.hidden_size <= 0 ||
         input.size() != static_cast<size_t>(config.hidden_size) * static_cast<size_t>(seq_len)) {
         LOG_ERR("VoxCPM2ResidualLM::prefill_kv: invalid input\n");
         return {};
     }
+    if (n_past + seq_len > config.max_length) {
+        LOG_ERR("VoxCPM2ResidualLM::prefill_kv: %d positions exceed the KV cache length %d\n", n_past + seq_len,
+                config.max_length);
+        return {};
+    }
 
-    kv_cache.clear();
+    if (n_past == 0) {
+        kv_cache.clear();
+    }
 
     GgmlContextGuard ctx_guard(kMediumGraphMem, true);
     ggml_context *   ctx = ctx_guard.get();
@@ -490,13 +526,13 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
     // an uninitialized mask, corrupting the prefill output and the cached K/V.)
     ggml_tensor * mask_t = nullptr;
     if (seq_len > 1) {
-        mask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, GGML_PAD(seq_len, GGML_KQ_MASK_PAD));
+        mask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_past + seq_len, GGML_PAD(seq_len, GGML_KQ_MASK_PAD));
         ggml_set_input(mask_t);
     }
 
     std::vector<ggml_tensor *> cache_writes;
-    ggml_tensor * output =
-        voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache, mask_t, &cache_writes);
+    ggml_tensor * output = voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache, mask_t,
+                                                               &cache_writes, n_past);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
     ggml_set_output(output);
@@ -514,7 +550,7 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
 
     ggml_backend_tensor_set(input_t, input.data(), 0, input.size() * sizeof(float));
     if (mask_t) {
-        const std::vector<float> mask = make_causal_mask(seq_len);
+        const std::vector<float> mask = n_past == 0 ? make_causal_mask(seq_len) : make_causal_mask_offset(seq_len, n_past);
         ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
     }
 
@@ -531,6 +567,11 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
 std::vector<float> VoxCPM2ResidualLM::forward_step(const std::vector<float> & input_1d, int position) {
     if (!backend || config.hidden_size <= 0 || input_1d.size() != static_cast<size_t>(config.hidden_size)) {
         LOG_ERR("VoxCPM2ResidualLM::forward_step: invalid input\n");
+        return {};
+    }
+    if (position < 0 || position >= config.max_length) {
+        LOG_ERR("VoxCPM2ResidualLM::forward_step: position %d is outside the KV cache length %d\n", position,
+                config.max_length);
         return {};
     }
 
@@ -621,10 +662,12 @@ void VoxCPM2Runtime::clear_error() {
 
 bool VoxCPM2Runtime::init(const std::string & base_lm_path,
                           const std::string & acoustic_path,
-                          int                 n_gpu_layers,
-                          bool                use_gpu_backend) {
+                          int                           n_gpu_layers,
+                          bool                          use_gpu_backend,
+                          const VoxCPM2RuntimeOptions & opts) {
     free();
     clear_error();
+    options = opts;
 
     ggml_backend_load_all();
 
@@ -643,7 +686,9 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
 
     LOG_INF("VoxCPM2Runtime: custom component backend=%s\n", ggml_backend_name(backend));
 
-    if (!base_lm.init(base_lm_path, n_gpu_layers)) {
+    LOG_INF("VoxCPM2Runtime: lm_ctx=%d residual_ctx=%d prefix_cache=%s\n", options.lm_ctx, options.residual_ctx,
+            options.prefix_cache ? "on" : "off");
+    if (!base_lm.init(base_lm_path, n_gpu_layers, options.lm_ctx)) {
         return fail("failed to initialize BaseLM");
     }
     if (!token_embeddings.load(base_lm_path)) {
@@ -664,7 +709,7 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
     if (!fsq.init_from_gguf(acoustic_path, backend)) {
         return fail("failed to initialize FSQ");
     }
-    if (!residual_lm.init_from_gguf(acoustic_path, backend)) {
+    if (!residual_lm.init_from_gguf(acoustic_path, backend, options.residual_ctx)) {
         return fail("failed to initialize ResidualLM");
     }
     if (!loc_enc.init_from_gguf(acoustic_path, backend)) {
@@ -798,6 +843,7 @@ void VoxCPM2Runtime::reset_state() {
     current_position  = 0;
     audio_frame_count = 0;
     state_ready       = false;
+    prefix_valid      = false;  // booktory: the KV caches no longer hold that prefix
     base_lm.clear_kv_cache();
     residual_lm.clear_kv();
 }
@@ -842,40 +888,95 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         return fail("audio_feat must be [feat_dim, patch_size, seq_len] when feat_mask is set");
     }
 
-    reset_state();
-
-    std::vector<float> combined(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
-    std::vector<float> token_embed;
-    for (int i = 0; i < seq_len; ++i) {
-        if (text_mask[static_cast<size_t>(i)] == 0) {
-            continue;
-        }
-        if (!token_embeddings.embedding_for_token(inputs.token_ids[static_cast<size_t>(i)], token_embed)) {
-            return fail("failed to read token embedding");
-        }
-        std::copy_n(token_embed.data(), static_cast<size_t>(hidden),
-                    combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+    // booktory: the prompt and the generated patches must fit both KV caches.
+    if (seq_len > options.lm_ctx || seq_len > options.residual_ctx) {
+        return fail("prefill of " + std::to_string(seq_len) + " positions does not fit the context (lm_ctx " +
+                    std::to_string(options.lm_ctx) + ", residual_ctx " + std::to_string(options.residual_ctx) + ")");
     }
 
-    std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
-    if (has_feat) {
-        std::vector<float> loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
-        if (loc_hidden.empty()) {
+    // booktory: reuse the longest prefix shared with the previous prefill. Every
+    // stage before the two causal LMs is per position, and the LMs' KV caches for
+    // those positions are still valid, so only the remaining positions are run.
+    // At least the last position is always recomputed: its outputs seed decoding.
+    int reuse = 0;
+    if (options.prefix_cache && prefix_valid) {
+        const int n_prev = static_cast<int>(prefix_inputs.token_ids.size());
+        const int limit  = std::min(n_prev, seq_len - 1);
+        while (reuse < limit) {
+            const size_t i = static_cast<size_t>(reuse);
+            if (prefix_inputs.token_ids[i] != inputs.token_ids[i] || prefix_inputs.text_mask[i] != text_mask[i] ||
+                prefix_inputs.feat_mask[i] != feat_mask[i]) {
+                break;
+            }
+            if (feat_mask[i] != 0 &&
+                std::memcmp(prefix_inputs.audio_feat.data() + i * static_cast<size_t>(patch_elems),
+                            inputs.audio_feat.data() + i * static_cast<size_t>(patch_elems),
+                            static_cast<size_t>(patch_elems) * sizeof(float)) != 0) {
+                break;
+            }
+            ++reuse;
+        }
+    }
+    prefix_valid           = false;
+    stats.prompt_positions = seq_len;
+    stats.reused_positions = reuse;
+
+    if (reuse > 0) {
+        lm_hidden.clear();
+        residual_hidden.clear();
+        residual_input_history.clear();
+        output_pool.clear();
+        current_position  = 0;
+        audio_frame_count = 0;
+        state_ready       = false;
+        base_lm.truncate_kv_cache(reuse);
+    } else {
+        reset_state();
+    }
+
+    const int    n_new  = seq_len - reuse;
+    const size_t hsz    = static_cast<size_t>(hidden);
+    const size_t offset = static_cast<size_t>(reuse);
+
+    std::vector<float> combined(hsz * static_cast<size_t>(n_new), 0.0f);
+    std::vector<float> token_embed;
+    for (int j = 0; j < n_new; ++j) {
+        const size_t i = offset + static_cast<size_t>(j);
+        if (text_mask[i] == 0) {
+            continue;
+        }
+        if (!token_embeddings.embedding_for_token(inputs.token_ids[i], token_embed)) {
+            return fail("failed to read token embedding");
+        }
+        std::copy_n(token_embed.data(), hsz, combined.data() + static_cast<size_t>(j) * hsz);
+    }
+
+    // Audio positions: LocEnc + enc_to_lm only where feat_mask is set (the
+    // embeddings of the other positions were computed and then discarded).
+    std::vector<int> feat_rows;
+    for (int j = 0; j < n_new; ++j) {
+        if (feat_mask[offset + static_cast<size_t>(j)] != 0) {
+            feat_rows.push_back(j);
+        }
+    }
+    const bool new_feat = !feat_rows.empty();
+    if (new_feat) {
+        auto t_locenc = StageClock::now();
+        std::vector<float> patches;
+        patches.reserve(feat_rows.size() * static_cast<size_t>(patch_elems));
+        for (int j : feat_rows) {
+            const float * p = inputs.audio_feat.data() + (offset + static_cast<size_t>(j)) * static_cast<size_t>(patch_elems);
+            patches.insert(patches.end(), p, p + patch_elems);
+        }
+        std::vector<float> feat_embed = embed_audio_patches(patches, static_cast<int>(feat_rows.size()));
+        if (feat_embed.size() != feat_rows.size() * hsz) {
             return fail("LocEnc sequence forward failed");
         }
-        feat_embed = run_enc_to_lm(loc_hidden, seq_len);
-        if (feat_embed.empty()) {
-            return fail("enc_to_lm projection failed");
+        for (size_t r = 0; r < feat_rows.size(); ++r) {
+            std::copy_n(feat_embed.data() + r * hsz, hsz,
+                        combined.data() + static_cast<size_t>(feat_rows[r]) * hsz);
         }
-
-        for (int i = 0; i < seq_len; ++i) {
-            if (feat_mask[static_cast<size_t>(i)] == 0) {
-                continue;
-            }
-            std::copy_n(feat_embed.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
-                        static_cast<size_t>(hidden),
-                        combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
-        }
+        stats.locenc += seconds_since(t_locenc);
     }
 
     std::vector<float> base_input = combined;
@@ -885,59 +986,50 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         }
     }
 
-    if (!base_lm.prefill(base_input.data(), seq_len, 0)) {
+    auto t_lm = StageClock::now();
+    if (!base_lm.prefill(base_input.data(), n_new, reuse)) {
         return fail("BaseLM prefill failed");
     }
     std::vector<float> base_hidden = base_lm.get_all_hidden();
-    if (base_hidden.size() != static_cast<size_t>(hidden) * static_cast<size_t>(seq_len)) {
+    if (base_hidden.size() != hsz * static_cast<size_t>(n_new)) {
         return fail("BaseLM did not return all prefill hidden states");
     }
+    stats.lm_prefill += seconds_since(t_lm);
 
+    auto t_res = StageClock::now();
     std::vector<float> blended = base_hidden;
-    if (has_feat) {
-        std::vector<float> fsq_hidden = run_fsq(base_hidden, seq_len);
+    if (new_feat) {
+        std::vector<float> fsq_hidden = run_fsq(base_hidden, n_new);
         if (fsq_hidden.empty()) {
             return fail("FSQ prefill forward failed");
         }
-        for (int i = 0; i < seq_len; ++i) {
-            if (feat_mask[static_cast<size_t>(i)] == 0) {
-                continue;
-            }
-            std::copy_n(fsq_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
-                        static_cast<size_t>(hidden),
-                        blended.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+        for (int j : feat_rows) {
+            std::copy_n(fsq_hidden.data() + static_cast<size_t>(j) * hsz, hsz,
+                        blended.data() + static_cast<size_t>(j) * hsz);
         }
     }
 
-    std::vector<float> feat_embed_masked(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
-    for (int i = 0; i < seq_len; ++i) {
-        if (feat_mask[static_cast<size_t>(i)] == 0) {
-            continue;
-        }
-        std::copy_n(combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden), static_cast<size_t>(hidden),
-                    feat_embed_masked.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+    std::vector<float> feat_embed_masked(hsz * static_cast<size_t>(n_new), 0.0f);
+    for (int j : feat_rows) {
+        std::copy_n(combined.data() + static_cast<size_t>(j) * hsz, hsz,
+                    feat_embed_masked.data() + static_cast<size_t>(j) * hsz);
     }
 
-    // Store for debug/dump
-
-    std::vector<float> residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, seq_len);
+    std::vector<float> residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, n_new);
     if (residual_fusion_input.empty()) {
         return fail("residual fusion prefill failed");
     }
 
-    // Store for debug/dump
-
     // Single consistent path (mirrors PyTorch voxcpm2.py:1036-1041): the SAME
     // forward that populates the ResidualLM KV cache also produces residual_hidden,
     // so decode step 0 attends to exactly the K/V that produced the prefill output.
-    // prefill_kv() now returns the last hidden state of the prefill forward and the
-    // cache writes are pure graph sinks that do not perturb that value.
-    residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
-    if (residual_hidden.size() != static_cast<size_t>(hidden)) {
+    residual_hidden = residual_lm.prefill_kv(residual_fusion_input, n_new, reuse);
+    if (residual_hidden.size() != hsz) {
         return fail("ResidualLM KV cache prefill failed");
     }
+    stats.res_prefill += seconds_since(t_res);
 
-    copy_token(blended, hidden, seq_len - 1, lm_hidden);
+    copy_token(blended, hidden, n_new - 1, lm_hidden);
 
     prefix_feat_cond.assign(static_cast<size_t>(patch_elems), 0.0f);
     output_pool.clear();
@@ -951,7 +1043,60 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     audio_frame_count = 0;
     state_ready       = true;
 
+    if (options.prefix_cache) {
+        prefix_inputs.token_ids  = inputs.token_ids;
+        prefix_inputs.text_mask  = text_mask;
+        prefix_inputs.feat_mask  = feat_mask;
+        prefix_inputs.audio_feat = has_feat ? inputs.audio_feat : std::vector<float>{};
+        // Without audio there is nothing to compare, so the feat masks (all 0) stop the memcmp.
+        prefix_valid = true;
+    }
     return true;
+}
+
+// booktory: LocEnc + enc_to_lm for n audio patches, a bounded number of patches
+// per graph; the result of an identical patch list is reused.
+std::vector<float> VoxCPM2Runtime::embed_audio_patches(const std::vector<float> & patches, int n_patches) {
+    if (options.prefix_cache && patches == locenc_cache_in && !locenc_cache_out.empty()) {
+        return locenc_cache_out;
+    }
+    const size_t patch_elems = static_cast<size_t>(feat_dim()) * static_cast<size_t>(patch_size());
+    const size_t enc_hidden  = static_cast<size_t>(loc_enc.config.transformer.hidden_size);
+    std::vector<float> loc_hidden;
+    loc_hidden.reserve(static_cast<size_t>(n_patches) * enc_hidden);
+    for (int start = 0; start < n_patches; start += kLocEncPatchesPerGraph) {
+        const int          n = std::min(kLocEncPatchesPerGraph, n_patches - start);
+        std::vector<float> chunk(patches.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(start) * patch_elems),
+                                 patches.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(start + n) * patch_elems));
+        std::vector<float> out = run_locenc_sequence(chunk, n);
+        if (out.size() != static_cast<size_t>(n) * enc_hidden) {
+            return {};
+        }
+        loc_hidden.insert(loc_hidden.end(), out.begin(), out.end());
+    }
+    std::vector<float> embed = run_enc_to_lm(loc_hidden, n_patches);
+    if (options.prefix_cache && !embed.empty()) {
+        locenc_cache_in  = patches;
+        locenc_cache_out = embed;
+    }
+    return embed;
+}
+
+// booktory: AudioVAE-encode the reference once per distinct WAV.
+std::vector<float> VoxCPM2Runtime::encode_reference_cached(const std::vector<float> & reference_wav, int sample_rate) {
+    auto t = StageClock::now();
+    if (options.prefix_cache && !ref_cache_feat.empty() && ref_cache_sr == sample_rate && ref_cache_wav == reference_wav) {
+        stats.ref_cached = true;
+        return ref_cache_feat;
+    }
+    std::vector<float> feat = encode_reference_audio(reference_wav, sample_rate);
+    stats.ref_encode += seconds_since(t);
+    if (options.prefix_cache && !feat.empty()) {
+        ref_cache_wav  = reference_wav;
+        ref_cache_sr   = sample_rate;
+        ref_cache_feat = feat;
+    }
+    return feat;
 }
 
 std::vector<float> VoxCPM2Runtime::random_noise() {
@@ -1228,9 +1373,11 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return result;
     }
 
+    auto t_cfm = StageClock::now();
     if (!run_decode_front_half(noise, params, result)) {
         return result;
     }
+    stats.cfm += seconds_since(t_cfm);
     if (!finite_vector(result.latent_patch) || !finite_vector(result.current_embed)) {
         fail("decode_step produced non-finite patch or embedding");
         return {};
@@ -1244,6 +1391,7 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         }
     }
 
+    auto t_lm = StageClock::now();
     if (!base_lm.decode_step(base_input.data(), current_position)) {
         fail("BaseLM decode_step failed");
         return {};
@@ -1254,6 +1402,8 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         fail("BaseLM decode_step did not return a hidden state");
         return {};
     }
+    stats.lm_step += seconds_since(t_lm);
+    auto t_res = StageClock::now();
 
     lm_hidden = run_fsq(base_hidden, 1);
     if (lm_hidden.size() != static_cast<size_t>(hidden)) {
@@ -1271,6 +1421,7 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         fail("ResidualLM forward_step failed");
         return {};
     }
+    stats.res_step += seconds_since(t_res);
 
     prefix_feat_cond = result.latent_patch;
     output_pool.push_back(result.latent_patch);
@@ -1282,15 +1433,20 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
 
 void VoxCPM2Runtime::decode_loop(const VoxCPM2GenerateParams &                                params,
                                  const std::function<void(const VoxCPM2DecodeStepResult &)> & callback) {
+    // booktory: a clip that runs to max_steps without the stop predictor firing is "capped".
+    stats.capped = params.max_steps > 0;
     for (int i = 0; i < params.max_steps; ++i) {
         VoxCPM2DecodeStepResult step = decode_step(params);
         if (step.latent_patch.empty()) {
+            stats.capped = false;
             break;
         }
+        ++stats.steps;
         if (callback) {
             callback(step);
         }
         if (params.stop_on_predictor && i > params.min_steps && step.should_stop) {
+            stats.capped = false;
             break;
         }
     }
@@ -1383,7 +1539,10 @@ std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch
 }
 
 std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
-    return decode_pool_range_to_waveform(0, -1, target_sr);
+    auto t = StageClock::now();
+    std::vector<float> wav = decode_pool_range_to_waveform(0, -1, target_sr);
+    stats.vae_decode += seconds_since(t);  // booktory
+    return wav;
 }
 
 std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<float> & patch, int target_sr) {
@@ -1779,7 +1938,7 @@ std::vector<float> VoxCPM2Runtime::generate_with_clone(const std::string &      
         return {};
     }
 
-    std::vector<float> reference_feat = encode_reference_audio(reference_wav, params.reference_sample_rate);
+    std::vector<float> reference_feat = encode_reference_cached(reference_wav, params.reference_sample_rate);
     if (reference_feat.empty()) {
         return {};
     }
@@ -1820,7 +1979,7 @@ std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string 
     }
 
     // VAE-encode the prompt audio with the existing reference-audio encoder.
-    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, params.reference_sample_rate);
+    std::vector<float> prompt_feat = encode_reference_cached(prompt_wav, params.reference_sample_rate);
     if (prompt_feat.empty()) {
         return {};
     }
@@ -1956,7 +2115,7 @@ bool VoxCPM2Runtime::generate_with_clone_streaming(const std::string &          
         return false;
     }
 
-    std::vector<float> reference_feat = encode_reference_audio(reference_wav, params.reference_sample_rate);
+    std::vector<float> reference_feat = encode_reference_cached(reference_wav, params.reference_sample_rate);
     if (reference_feat.empty()) {
         return false;
     }
@@ -1991,7 +2150,7 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
         return false;
     }
 
-    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, params.reference_sample_rate);
+    std::vector<float> prompt_feat = encode_reference_cached(prompt_wav, params.reference_sample_rate);
     if (prompt_feat.empty()) {
         return false;
     }
@@ -2011,6 +2170,14 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
 }
 
 void VoxCPM2Runtime::free() {
+    // booktory: drop the work reused across calls.
+    ref_cache_wav.clear();
+    ref_cache_feat.clear();
+    ref_cache_sr = 0;
+    prefix_inputs = {};
+    prefix_valid  = false;
+    locenc_cache_in.clear();
+    locenc_cache_out.clear();
     cached_front_half.free_graph();
     reset_state();
     audio_vae.free();

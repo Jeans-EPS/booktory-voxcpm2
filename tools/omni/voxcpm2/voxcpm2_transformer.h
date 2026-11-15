@@ -183,6 +183,9 @@ ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                   
 // it is required when n_tokens > 1. If `cache_writes` is non-null, the per-layer
 // K/V cache-write tensors are appended to it; the caller MUST add them to the
 // graph as additional roots.
+// booktory: with n_past > 0 the prefill continues after n_past positions already
+// in the cache (positions n_past..n_past+n_tokens-1); the mask is then
+// [n_past+n_tokens(keys), >=n_tokens(queries)].
 ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                    ctx,
                                                   const VoxCPM2TransformerConfig &  cfg,
                                                   const VoxCPM2TransformerWeights & weights,
@@ -190,4 +193,5 @@ ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                
                                                   int                               n_tokens,
                                                   VoxCPM2KVCache &                  kv_cache,
                                                   ggml_tensor *                     attention_mask = nullptr,
-                                                  std::vector<ggml_tensor *> *      cache_writes   = nullptr);
+                                                  std::vector<ggml_tensor *> *      cache_writes   = nullptr,
+                                                  int                               n_past         = 0);

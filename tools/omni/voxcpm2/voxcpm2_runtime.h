@@ -35,6 +35,33 @@ struct VoxCPM2GenerateParams {
     bool     append_audio_start    = true;
 };
 
+// booktory: runtime options fixed at init.
+struct VoxCPM2RuntimeOptions {
+    int  lm_ctx       = 4096;  // BaseLM n_ctx (upstream: 32768)
+    int  residual_ctx = 4096;  // ResidualLM KV max_length (upstream: 32768)
+    // Reuse work across calls: the AudioVAE encoding of an unchanged reference,
+    // the LocEnc embedding of unchanged audio positions, and the KV caches of the
+    // longest prefill prefix shared with the previous call.
+    bool prefix_cache = true;
+};
+
+// booktory: wall time per stage of the last generate_* call, in seconds.
+struct VoxCPM2ClipStats {
+    double ref_encode   = 0.0;  // AudioVAE encode of the reference/prompt WAV
+    double locenc       = 0.0;  // LocEnc + enc_to_lm over prefill audio positions
+    double lm_prefill   = 0.0;  // BaseLM prefill
+    double res_prefill  = 0.0;  // FSQ + residual fusion + ResidualLM prefill
+    double cfm          = 0.0;  // per patch: CFM/LocDiT solve + LocEnc + stop predictor
+    double lm_step      = 0.0;  // per patch: BaseLM decode step
+    double res_step     = 0.0;  // per patch: FSQ + fusion + ResidualLM step
+    double vae_decode   = 0.0;  // AudioVAE decode of all patches
+    int    prompt_positions = 0;  // prefill length
+    int    reused_positions = 0;  // prefill positions taken from the previous call
+    bool   ref_cached       = false;
+    int    steps            = 0;  // patches generated
+    bool   capped           = false;  // stopped by max_steps, not by the stop predictor
+};
+
 struct VoxCPM2PrefillInputs {
     // Token sequence already arranged on the VoxCPM2 timeline.
     std::vector<int32_t> token_ids;
@@ -86,12 +113,13 @@ struct VoxCPM2ResidualLM {
     VoxCPM2ResidualLM(VoxCPM2ResidualLM &&)                  = delete;
     VoxCPM2ResidualLM & operator=(VoxCPM2ResidualLM &&)      = delete;
 
-    bool               init_from_gguf(const std::string & path, ggml_backend_t backend);
+    bool               init_from_gguf(const std::string & path, ggml_backend_t backend, int max_length = 4096);
     // Full-sequence forward (no KV cache)
     std::vector<float> forward(const std::vector<float> & input, int seq_len) const;
     std::vector<float> forward_last(const std::vector<float> & input, int seq_len) const;
-    // Prefill with KV cache (populates cache positions 0..seq_len-1, returns last hidden)
-    std::vector<float> prefill_kv(const std::vector<float> & input, int seq_len);
+    // Prefill with KV cache (populates cache positions n_past..n_past+seq_len-1, returns last hidden).
+    // n_past > 0 continues after positions already in the cache (booktory prefix reuse).
+    std::vector<float> prefill_kv(const std::vector<float> & input, int seq_len, int n_past = 0);
     // Single-step decode with KV cache (processes 1 token at `position`)
     std::vector<float> forward_step(const std::vector<float> & input_1d, int position);
     void               clear_kv();
@@ -129,8 +157,12 @@ struct VoxCPM2Runtime {
 
     bool init(const std::string & base_lm_path,
               const std::string & acoustic_path,
-              int                 n_gpu_layers    = -1,
-              bool                use_gpu_backend = true);
+              int                           n_gpu_layers    = -1,
+              bool                          use_gpu_backend = true,
+              const VoxCPM2RuntimeOptions & options         = {});
+
+    // booktory: stage timings of the last generate_* call.
+    VoxCPM2ClipStats stats;
 
     bool prefill(const VoxCPM2PrefillInputs & inputs);
     bool prefill_tokens(const std::vector<int32_t> & token_ids);
@@ -203,6 +235,18 @@ struct VoxCPM2Runtime {
     std::unordered_map<int32_t, std::vector<int32_t>> cjk_split_map;
     std::unordered_map<int32_t, std::vector<int32_t>> cjk_prefix_single_split_map;
     std::unordered_set<int32_t>                       cjk_token_ids;
+
+    // booktory: work reused across calls (see VoxCPM2RuntimeOptions::prefix_cache).
+    VoxCPM2RuntimeOptions options;
+    std::vector<float>    ref_cache_wav;  // reference WAV whose encoding is cached
+    int                   ref_cache_sr = 0;
+    std::vector<float>    ref_cache_feat;
+    VoxCPM2PrefillInputs  prefix_inputs;  // last successful prefill (masks filled in)
+    bool                  prefix_valid = false;
+    std::vector<float>    locenc_cache_in;   // audio patches of the last LocEnc run
+    std::vector<float>    locenc_cache_out;  // their enc_to_lm embeddings
+    std::vector<float>    encode_reference_cached(const std::vector<float> & reference_wav, int sample_rate);
+    std::vector<float>    embed_audio_patches(const std::vector<float> & patches, int n_patches);
 
     // Cached decode-front-half graph (CFM solve + LocEnc + stop predictor).
     // Built once per (timesteps, cfg_value) pair and reused across decode steps.

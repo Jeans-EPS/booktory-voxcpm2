@@ -12,7 +12,7 @@
 // MiniCPMLM implementation
 // ============================================================================
 
-bool MiniCPMLM::init(const std::string & path, int n_gpu_layers) {
+bool MiniCPMLM::init(const std::string & path, int n_gpu_layers, int n_ctx) {
     // Load model
     struct llama_model_params model_params = llama_model_default_params();
     if (n_gpu_layers >= 0) {
@@ -39,8 +39,10 @@ bool MiniCPMLM::init(const std::string & path, int n_gpu_layers) {
 
     // Create context
     struct llama_context_params cparams_local = llama_context_default_params();
-    cparams_local.n_ctx       = 32768;
-    cparams_local.n_batch     = 1024;
+    // booktory: the context was a fixed 32768 (about 0.94 GB of F16 KV); a beat
+    // needs about 1,000 positions. n_batch covers a whole prefill in one call.
+    cparams_local.n_ctx       = n_ctx > 0 ? n_ctx : 4096;
+    cparams_local.n_batch     = cparams_local.n_ctx < 4096 ? cparams_local.n_ctx : 4096;
     cparams_local.embeddings  = true;
     cparams_local.offload_kqv = true;
     cparams = cparams_local;
@@ -184,6 +186,13 @@ std::vector<float> MiniCPMLM::get_logits() const {
 void MiniCPMLM::clear_kv_cache() {
     if (ctx) {
         llama_memory_clear(llama_get_memory(ctx), true);
+    }
+    last_n_outputs = 0;
+}
+
+void MiniCPMLM::truncate_kv_cache(int n_keep) {
+    if (ctx) {
+        llama_memory_seq_rm(llama_get_memory(ctx), 0, n_keep, -1);
     }
     last_n_outputs = 0;
 }

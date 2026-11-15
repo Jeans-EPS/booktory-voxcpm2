@@ -941,16 +941,24 @@ ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                
                                                   int                               n_tokens,
                                                   VoxCPM2KVCache &                  kv_cache,
                                                   ggml_tensor *                     attention_mask,
-                                                  std::vector<ggml_tensor *> *      cache_writes) {
+                                                  std::vector<ggml_tensor *> *      cache_writes,
+                                                  int                               n_past) {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(input != nullptr);
     GGML_ASSERT(input->ne[0] == cfg.hidden_size);
     GGML_ASSERT(n_tokens <= 1 || attention_mask != nullptr);
+    GGML_ASSERT(n_past >= 0);
 
     std::vector<ggml_tensor *> local_writes;
     std::vector<ggml_tensor *> & writes = cache_writes ? *cache_writes : local_writes;
 
-    ggml_tensor * positions = voxcpm2_build_positions(ctx, n_tokens);
+    // booktory: a prefill may continue after n_past cached positions (prefix
+    // reuse): positions run n_past..n_past+n_tokens-1 and attention also reads
+    // the cached K/V of the first n_past positions.
+    ggml_tensor * positions = n_past == 0
+        ? voxcpm2_build_positions(ctx, n_tokens)
+        : ggml_view_1d(ctx, voxcpm2_build_positions(ctx, n_past + n_tokens), n_tokens,
+                       static_cast<size_t>(n_past) * sizeof(int32_t));
 
     ggml_tensor * hidden = input;
     for (int i = 0; i < cfg.n_layer; ++i) {
@@ -958,7 +966,7 @@ ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                
 
         ggml_tensor * residual = hidden;
         ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
-        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, n_tokens, 0,
+        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, n_tokens, n_past,
                                                       kv_cache, writes, attention_mask);
         hidden = ggml_add(ctx, residual, attn_out);
 

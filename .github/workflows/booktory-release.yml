@@ -34,6 +34,11 @@ env:
     -DGGML_OPENMP=OFF
     -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
     -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+  # CUDA builds took 2h10m (Linux) and 2h46m (Windows) with ggml's default 8 architectures.
+  # Ship SASS for Ampere (86) and Ada (89) and PTX for Turing (75), which newer GPUs JIT-compile;
+  # Maxwell/Pascal/Volta (< 7.5) are left to the CPU build (booktory checks compute_cap).
+  # VoxCPM2 never uses flash attention (llama.cpp falls back without it), so its kernels are off.
+  CUDA_ARCHS: 75-virtual;86-real;89-real
 
 jobs:
   linux-cpu:
@@ -43,13 +48,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-cpu-${{ github.sha }}
+          restore-keys: ccache-linux-cpu-
       - name: Build
         run: |
           cmake -S . -B build -G Ninja $COMMON_FLAGS \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DVOXCPM2_CLI_VERSION="$TAG" \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
           cmake --build build --target voxcpm2-cli -j "$(nproc)"
+          ccache -s
       - name: Start check
         run: |
           ./build/bin/voxcpm2-cli --version
@@ -76,16 +88,24 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates ccache
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-linux-cuda-${{ github.sha }}
+          restore-keys: ccache-linux-cuda-
       - name: Build
         run: |
+          export CCACHE_DIR=/root/.cache/ccache
           cmake -S . -B build -G Ninja $COMMON_FLAGS \
-            -DGGML_CUDA=ON \
+            -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
             -DVOXCPM2_CLI_VERSION="$TAG" \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
             -DCMAKE_BUILD_RPATH='$ORIGIN'
           cmake --build build --target voxcpm2-cli -j "$(nproc)"
+          ccache -s
       - name: Pack
         run: |
           mkdir -p dist cudart
@@ -153,7 +173,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G Ninja %COMMON_FLAGS% -DGGML_CUDA=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVOXCPM2_CLI_VERSION=%TAG% "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" || exit /b 1
+          cmake -S . -B build -G Ninja %COMMON_FLAGS% -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF "-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHS%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVOXCPM2_CLI_VERSION=%TAG% "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" || exit /b 1
           cmake --build build --target voxcpm2-cli -j %NUMBER_OF_PROCESSORS% || exit /b 1
       - name: Pack
         run: |
