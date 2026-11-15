@@ -1,0 +1,189 @@
+# Builds voxcpm2-cli for booktory and publishes it on a Release.
+# Runs only for a pushed tag voxcpm2-v* (or by hand): private-repo minutes are limited.
+name: booktory release
+
+on:
+  push:
+    tags: ["voxcpm2-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)publish, e.g. voxcpm2-v1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: booktory-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # Portable x64 baseline (AVX2 + FMA + F16C + BMI2), static, no OpenMP runtime to ship.
+  COMMON_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_SHARED_LIBS=OFF
+    -DGGML_NATIVE=OFF
+    -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF
+    -DGGML_OPENMP=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja $COMMON_FLAGS \
+            -DVOXCPM2_CLI_VERSION="$TAG" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build build --target voxcpm2-cli -j "$(nproc)"
+      - name: Start check
+        run: |
+          ./build/bin/voxcpm2-cli --version
+          ldd ./build/bin/voxcpm2-cli
+          if ldd ./build/bin/voxcpm2-cli | grep -E 'libstdc\+\+|libgomp'; then echo 'unexpected shared runtime'; exit 1; fi
+      - name: Pack
+        run: |
+          mkdir -p dist
+          tar -C build/bin -czf dist/voxcpm2-cli-linux-x64-cpu.tar.gz voxcpm2-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cpu
+          path: dist/*
+
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja $COMMON_FLAGS \
+            -DGGML_CUDA=ON \
+            -DVOXCPM2_CLI_VERSION="$TAG" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+            -DCMAKE_BUILD_RPATH='$ORIGIN'
+          cmake --build build --target voxcpm2-cli -j "$(nproc)"
+      - name: Pack
+        run: |
+          mkdir -p dist cudart
+          tar -C build/bin -czf dist/voxcpm2-cli-linux-x64-cuda12.tar.gz voxcpm2-cli
+          cp -L /usr/local/cuda/lib64/libcudart.so.12 /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/libcublasLt.so.12 cudart/
+          tar -C cudart -czf dist/cudart-linux-x64-cuda12.tar.gz .
+      - name: Start check (no GPU here, so the build must load and report no usable GPU)
+        run: |
+          mkdir -p t
+          tar -C t -xzf dist/voxcpm2-cli-linux-x64-cuda12.tar.gz
+          tar -C t -xzf dist/cudart-linux-x64-cuda12.tar.gz
+          # The runner has no NVIDIA driver; the toolkit's stub libcuda lets the binary load.
+          mkdir -p stub && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so stub/libcuda.so.1
+          set +e
+          LD_LIBRARY_PATH="$PWD/stub" ./t/voxcpm2-cli --version > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          echo "exit code $rc"
+          LD_LIBRARY_PATH="$PWD/stub" ldd ./t/voxcpm2-cli
+          grep -q "^voxcpm2-cli $TAG" out.txt
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda
+          path: dist/*
+
+  windows-cpu:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja %COMMON_FLAGS% -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVOXCPM2_CLI_VERSION=%TAG% || exit /b 1
+          cmake --build build --target voxcpm2-cli -j %NUMBER_OF_PROCESSORS% || exit /b 1
+      - name: Start check
+        run: .\build\bin\voxcpm2-cli.exe --version
+      - name: Pack
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          7z a dist\voxcpm2-cli-win-x64-cpu.zip .\build\bin\voxcpm2-cli.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-cpu
+          path: dist/*
+
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA Toolkit 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "12.4"
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja %COMMON_FLAGS% -DGGML_CUDA=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVOXCPM2_CLI_VERSION=%TAG% "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" || exit /b 1
+          cmake --build build --target voxcpm2-cli -j %NUMBER_OF_PROCESSORS% || exit /b 1
+      - name: Pack
+        run: |
+          New-Item -ItemType Directory -Force dist, cudart | Out-Null
+          7z a dist\voxcpm2-cli-win-x64-cuda12.zip .\build\bin\voxcpm2-cli.exe
+          foreach ($d in "bin", "bin\x64") {
+            Get-ChildItem "$env:CUDA_PATH\$d" -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -ErrorAction SilentlyContinue | Copy-Item -Destination cudart
+          }
+          if (-not (Get-ChildItem cudart)) { throw "no CUDA runtime DLLs found under $env:CUDA_PATH" }
+          Get-ChildItem cudart
+          7z a dist\cudart-win-x64-cuda12.zip .\cudart\*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-cuda
+          path: dist/*
+
+  release:
+    needs: [linux-cpu, linux-cuda, windows-cpu, windows-cuda]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="voxcpm2-cli for booktory, built from $GITHUB_SHA. See BOOKTORY.md for the upstream pin and patches."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes "$notes" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+          fi
