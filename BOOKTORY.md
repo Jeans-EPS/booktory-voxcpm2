@@ -45,7 +45,10 @@ user's GitHub login and pins them by SHA-256 in `tools/lock/voxcpm2-cli.json`.
    `voxcpm2-v*` tag. CUDA builds use `CMAKE_CUDA_ARCHITECTURES=75-virtual;86-real;89-real` (SASS
    for Ampere and Ada, PTX for Turing that newer GPUs JIT-compile; GPUs below compute capability
    7.5 use the CPU build) and `GGML_CUDA_FA=OFF` (VoxCPM2 does not use flash attention). The Linux
-   jobs cache compiler output with ccache.
+   jobs cache compiler output with ccache. A manual dispatch with `linux_only` builds only the
+   Linux assets as run artifacts and publishes nothing: from `voxcpm2-v2` on, the Windows assets
+   are built locally (MSVC 2022 Build Tools; CUDA from NVIDIA's 12.4.1 redist archives, no
+   installer) with the same flags, and the release is assembled with `gh release create`.
 
 ## Release assets
 
