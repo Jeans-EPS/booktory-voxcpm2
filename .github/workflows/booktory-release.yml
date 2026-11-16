@@ -1,10 +1,9 @@
 # Builds voxcpm2-cli for booktory and publishes it on a Release.
-# Runs only for a pushed tag voxcpm2-v* (or by hand): private-repo minutes are limited.
+# Runs only by hand: Windows assets are built locally and the release is assembled with
+# gh release create (see BOOKTORY.md), so pushing a voxcpm2-v* tag starts nothing.
 name: booktory release
 
 on:
-  push:
-    tags: ["voxcpm2-v*"]
   workflow_dispatch:
     inputs:
       tag:

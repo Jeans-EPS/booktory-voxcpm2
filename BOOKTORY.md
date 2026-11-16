@@ -41,8 +41,8 @@ user's GitHub login and pins them by SHA-256 in `tools/lock/voxcpm2-cli.json`.
    - Each JSON result line adds `steps`, `maxSteps`, `capped` (the cap was hit before the stop
      predictor fired), `promptPositions`, `reusedPositions` and `stages`: seconds per stage
      (`refEncode`, `locEnc`, `lmPrefill`, `resPrefill`, `cfm`, `lmStep`, `resStep`, `vaeDecode`).
-4. **CI**: upstream workflows are removed; `.github/workflows/booktory-release.yml` builds on a
-   `voxcpm2-v*` tag. CUDA builds use `CMAKE_CUDA_ARCHITECTURES=75-virtual;86-real;89-real` (SASS
+4. **CI**: upstream workflows are removed; `.github/workflows/booktory-release.yml` runs only by hand
+   (`workflow_dispatch`). CUDA builds use `CMAKE_CUDA_ARCHITECTURES=75-virtual;86-real;89-real` (SASS
    for Ampere and Ada, PTX for Turing that newer GPUs JIT-compile; GPUs below compute capability
    7.5 use the CPU build) and `GGML_CUDA_FA=OFF` (VoxCPM2 does not use flash attention). The Linux
    jobs cache compiler output with ccache. A manual dispatch with `linux_only` builds only the
